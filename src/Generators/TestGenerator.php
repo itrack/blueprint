@@ -20,12 +20,17 @@ use Illuminate\Support\Str;
 class TestGenerator implements Generator
 {
     const INDENT = '        ';
+    const TESTS_VIEW = 1;
+    const TESTS_REDIRECT = 2;
+    const TESTS_SAVE = 4;
+    const TESTS_DELETE = 8;
 
     /** @var \Illuminate\Contracts\Filesystem\Filesystem */
     private $files;
 
     private $imports = [];
     private $stubs = [];
+    private $traits = [];
 
     public function __construct($files)
     {
@@ -74,19 +79,19 @@ class TestGenerator implements Generator
         $test_cases = '';
 
         foreach ($controller->methods() as $name => $statements) {
-            $context = Str::singular($controller->prefix());
-
-            if (in_array($name, ['edit', 'update', 'show', 'destroy'])) {
-                $reference = 'App\\' . $context;
-                $variable = '$' . Str::camel($context);
-
-                // TODO: make model factory
-            }
-
             $test_case = $template;
             $setup = [];
             $assertions = [];
             $request_data = [];
+            $tested_bits = 0;
+
+            $model = $controller->prefix();
+            $context = Str::singular($controller->prefix());
+            $variable = Str::camel($context);
+
+            if (in_array($name, ['edit', 'update', 'show', 'destroy'])) {
+                $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+            }
 
             foreach ($statements as $statement) {
                 if ($statement instanceof SendStatement) {
@@ -132,19 +137,23 @@ class TestGenerator implements Generator
                     $assertions[] = $assertion;
 
                 } elseif ($statement instanceof ValidateStatement) {
+                    $this->addTestAssertionsTrait($controller);
+
                     $class = $controller->name() . Str::studly($name) . 'Request';
 
-                    $this->addFakerTrait($controller);
 
                     // TODO: use FQCN
                     $test_case = $this->buildFormRequestTestCase($controller->className(), $name, '\\App\\Http\\Requests\\' . $class) . PHP_EOL . PHP_EOL . $test_case;
 
-                    foreach ($statement->data() as $data) {
-                        // TODO:
-                        // build faker data
-                        // build $data for request
-                        $request_data[$data] = '$' . $data;
+                    if ($statement->data()) {
+                        $this->addFakerTrait($controller);
+
+                        foreach ($statement->data() as $data) {
+                            $setup[] = sprintf('$%s = $this->faker->%s;', $data, 'word()');
+                            $request_data[$data] = '$' . $data;
+                        }
                     }
+
                 } elseif ($statement instanceof DispatchStatement) {
                     $this->addImport($controller, 'Illuminate\\Support\\Facades\\Queue');
                     $this->addImport($controller, 'App\\Jobs\\' . $statement->job());
@@ -226,6 +235,8 @@ class TestGenerator implements Generator
 
                     $assertions[] = $assertion;
                 } elseif ($statement instanceof RenderStatement) {
+                    $tested_bits |= self::TESTS_VIEW;
+
                     $assertions[] = '$response->assertOk();';
                     $assertions[] = sprintf('$response->assertViewIs(\'%s\');', $statement->view());
 
@@ -234,6 +245,8 @@ class TestGenerator implements Generator
                         $assertions[] = sprintf('$response->assertViewHas(\'%s\');', $data);
                     }
                 } elseif ($statement instanceof RedirectStatement) {
+                    $tested_bits |= self::TESTS_REDIRECT;
+
                     $assertion = sprintf('$response->assertRedirect(route(\'%s\'', $statement->route());
 
                     if ($statement->data()) {
@@ -251,33 +264,76 @@ class TestGenerator implements Generator
                 } elseif ($statement instanceof SessionStatement) {
                     $assertions[] = sprintf('$response->assertSessionHas(\'%s\', %s);', $statement->reference(), '$' . str_replace('.', '->', $statement->reference()));
                 } elseif ($statement instanceof EloquentStatement) {
-                    // TODO: setup factories
-                    $this->addImport($controller, 'App\\' . $this->determineModel($controller->prefix(), $statement->reference()));
+                    $this->addRefreshDatabaseTrait($controller);
+
+                    $model = $this->determineModel($controller->prefix(), $statement->reference());
+                    $this->addImport($controller, 'App\\' . $model);
+
+                    if ($statement->operation() === 'save') {
+                        $tested_bits |= self::TESTS_SAVE;
+
+                        $assertion = '';
+//                        '$posts = Post::where('title', $title)
+//                            ->where('content', $content)
+//                            ->get();
+//                        $this->assertCount(1, $posts);
+//                        $post = $posts->first();';
+
+                        // TODO: prepend as first assertion
+                        $assertions[] = $assertion;
+                    } elseif ($statement->operation() === 'find') {
+                        $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+                    } elseif ($statement->operation() === 'delete') {
+                        $tested_bits |= self::TESTS_DELETE;
+                        $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+                        $assertions[] = sprintf('$this->assertDeleted($%s);', $variable);
+                    }
                 } elseif ($statement instanceof QueryStatement) {
-                    // TODO: setup factories
+                    $this->addRefreshDatabaseTrait($controller);
+
                     $this->addImport($controller, 'App\\' . $this->determineModel($controller->prefix(), $statement->model()));
                 }
             }
 
-            // TODO: build request
-            $call = '';
+            $call = sprintf('$response = $this->%s(route(\'%s.%s\'', $this->httpMethodForAction($name), Str::lower($context), $name);
+
+            if (in_array($name, ['edit', 'update', 'show', 'destroy'])) {
+                $call .= ', $' . Str::camel($context);
+            }
+            $call .= ')';
+
+            if ($request_data) {
+                $output = var_export($request_data, true);
+                $output = preg_replace('/^\s+/m', str_pad(' ', 12), $output);
+                $output = preg_replace(['/^array\s\(/', "/\)$/"], ['[', str_pad(' ', 8) . ']'], $output);
+
+                $call .= ', ' . trim($output);
+            }
+            $call .= ');';
 
             $test_case = str_replace('// setup...', implode(PHP_EOL . self::INDENT, $setup), $test_case);
             $test_case = str_replace('// call...', $call, $test_case);
             $test_case = str_replace('// verify...', implode(PHP_EOL . self::INDENT, $assertions), $test_case);
 
-            // TODO: flag of type (action + render/redirect)
-            $test_case = str_replace('dummy_test_case', $name, $test_case);
+            $test_case = str_replace('dummy_test_case', $this->buildTestCaseName($name, $tested_bits), $test_case);
 
             $test_cases .= PHP_EOL . $test_case . PHP_EOL;
         }
 
-        return trim($test_cases);
+        return trim($this->buildTraits($controller) . PHP_EOL . $test_cases);
     }
 
     protected function addTrait(Controller $controller, $trait)
     {
-        // TODO:
+        $this->traits[$controller->name()][] = $trait;
+    }
+
+    private function buildTraits(Controller $controller)
+    {
+        $traits = array_unique($this->traits[$controller->name()]);
+        sort($traits);
+
+        return 'use ' . implode(', ', $traits) . ';';
     }
 
     private function testCaseStub()
@@ -350,5 +406,52 @@ END;
     {
         $this->addImport($controller, 'Illuminate\\Foundation\\Testing\\RefreshDatabase');
         $this->addTrait($controller, 'RefreshDatabase');
+    }
+
+    private function httpMethodForAction($action)
+    {
+        switch ($action) {
+            case 'store':
+                return 'post';
+            case 'update':
+                return 'put';
+            case 'delete':
+                return 'delete';
+            default:
+                return 'get';
+        }
+    }
+
+    private function buildTestCaseName(string $name, int $tested_bits)
+    {
+        $verifications = [];
+
+        if ($tested_bits & self::TESTS_SAVE) {
+            $verifications[] = 'saves';
+        }
+
+        if ($tested_bits & self::TESTS_DELETE) {
+            $verifications[] = 'deletes';
+        }
+
+        if ($tested_bits & self::TESTS_VIEW) {
+            $verifications[] = 'displays_view';
+        }
+
+        if ($tested_bits & self::TESTS_REDIRECT) {
+            $verifications[] = 'redirects';
+        }
+
+        if (empty($verifications)) {
+            return $name . '_behaves_as_expected';
+        }
+
+        $final_verification = array_pop($verifications);
+
+        if (empty($verifications)) {
+            return $name . '_' . $final_verification;
+        }
+
+        return $name . '_' . implode('_', $verifications) . '_and_' . $final_verification;
     }
 }

@@ -49,7 +49,7 @@ class PostControllerTest extends TestCase
     /**
      * @test
      */
-    public function store_saves_posts_and_redirects()
+    public function store_saves_and_redirects()
     {
         $title = $this->faker->words(3, true);
         $content = $this->faker->sentences(3, true);
