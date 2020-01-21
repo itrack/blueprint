@@ -75,11 +75,9 @@ class PostControllerTest extends TestCase
         Mail::assertSent(ReviewNotification::class, function ($mailable) use ($post) {
             return $mailable->hasTo($post->author) && $mailable->post->is($post);
         });
-
         Queue::assertPushed(SyncMedia::class, function ($job) use ($post) {
             return $job->post->is($post);
         });
-
         Event::assertDispatched(NewPost::class, function ($event, $arguments) use ($post) {
             return $arguments[0]->is($post);
         });

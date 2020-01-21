@@ -4,6 +4,9 @@ namespace DummyNamespace;
 
 // imports...
 
+/**
+ * @see DummyController
+ */
 class DummyClass extends TestCase
 {
     // test cases...

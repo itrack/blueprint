@@ -4,6 +4,7 @@
 namespace Blueprint\Generators;
 
 
+use Blueprint\Blueprint;
 use Blueprint\Contracts\Generator;
 use Blueprint\Models\Controller;
 use Blueprint\Models\Statements\DispatchStatement;
@@ -19,7 +20,6 @@ use Illuminate\Support\Str;
 
 class TestGenerator implements Generator
 {
-    const INDENT = '        ';
     const TESTS_VIEW = 1;
     const TESTS_REDIRECT = 2;
     const TESTS_SAVE = 4;
@@ -59,13 +59,15 @@ class TestGenerator implements Generator
 
     protected function getPath(Controller $controller)
     {
-        return 'tests/Feature/Http/Controllers/' . $controller->className() . 'Test.php';
+        $path = str_replace('\\', '/', Blueprint::relativeNamespace($controller->fullyQualifiedClassName()));
+
+        return 'tests/Feature/' . $path . 'Test.php';
     }
 
     protected function populateStub(string $stub, Controller $controller)
     {
-        // TODO: nested controllers...
-        $stub = str_replace('DummyNamespace', 'Tests\\Feature\\Http\\Controllers', $stub);
+        $stub = str_replace('DummyNamespace', 'Tests\\Feature\\' . Blueprint::relativeNamespace($controller->fullyQualifiedNamespace()), $stub);
+        $stub = str_replace('DummyController', '\\' . $controller->fullyQualifiedClassName(), $stub);
         $stub = str_replace('DummyClass', $controller->className(), $stub);
         $stub = str_replace('// test cases...', $this->buildTestCases($controller), $stub);
         $stub = str_replace('// imports...', $this->buildImports($controller), $stub);
@@ -80,8 +82,16 @@ class TestGenerator implements Generator
 
         foreach ($controller->methods() as $name => $statements) {
             $test_case = $template;
-            $setup = [];
-            $assertions = [];
+            $setup = [
+                'data' => [],
+                'mock' => [],
+            ];
+            $assertions = [
+                'sanity' => [],
+                'response' => [],
+                'generic' => [],
+                'mock' => [],
+            ];
             $request_data = [];
             $tested_bits = 0;
 
@@ -90,15 +100,15 @@ class TestGenerator implements Generator
             $variable = Str::camel($context);
 
             if (in_array($name, ['edit', 'update', 'show', 'destroy'])) {
-                $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+                $setup['data'][] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
             }
 
             foreach ($statements as $statement) {
                 if ($statement instanceof SendStatement) {
                     $this->addImport($controller, 'Illuminate\\Support\\Facades\\Mail');
-                    $this->addImport($controller, 'App\\Mail\\' . $statement->mail());
+                    $this->addImport($controller, config('blueprint.namespace') . '\\Mail\\' . $statement->mail());
 
-                    $setup[] = 'Mail::fake();';
+                    $setup['mock'][] = 'Mail::fake();';
 
                     $assertion = sprintf('Mail::assertSent(%s::class', $statement->mail());
 
@@ -134,31 +144,29 @@ class TestGenerator implements Generator
 
                     $assertion .= '));';
 
-                    $assertions[] = $assertion;
+                    $assertions['mock'][] = $assertion;
 
                 } elseif ($statement instanceof ValidateStatement) {
                     $this->addTestAssertionsTrait($controller);
 
                     $class = $controller->name() . Str::studly($name) . 'Request';
-
-
-                    // TODO: use FQCN
-                    $test_case = $this->buildFormRequestTestCase($controller->className(), $name, '\\App\\Http\\Requests\\' . $class) . PHP_EOL . PHP_EOL . $test_case;
+                    $test_case = $this->buildFormRequestTestCase($controller->fullyQualifiedClassName(), $name, config('blueprint.namespace') . '\\Http\\Requests\\' . $class) . PHP_EOL . PHP_EOL . $test_case;
 
                     if ($statement->data()) {
                         $this->addFakerTrait($controller);
 
                         foreach ($statement->data() as $data) {
-                            $setup[] = sprintf('$%s = $this->faker->%s;', $data, 'word()');
+                            // TODO: generate the correct faker data
+                            $setup['data'][] = sprintf('$%s = $this->faker->%s;', $data, 'word()');
                             $request_data[$data] = '$' . $data;
                         }
                     }
 
                 } elseif ($statement instanceof DispatchStatement) {
                     $this->addImport($controller, 'Illuminate\\Support\\Facades\\Queue');
-                    $this->addImport($controller, 'App\\Jobs\\' . $statement->job());
+                    $this->addImport($controller, config('blueprint.namespace') . '\\Jobs\\' . $statement->job());
 
-                    $setup[] = 'Queue::fake();';
+                    $setup['mock'][] = 'Queue::fake();';
 
                     $assertion = sprintf('Queue::assertPushed(%s::class', $statement->job());
 
@@ -190,18 +198,18 @@ class TestGenerator implements Generator
 
                     $assertion .= '));';
 
-                    $assertions[] = $assertion;
+                    $assertions['mock'][] = $assertion;
                 } elseif ($statement instanceof FireStatement) {
                     $this->addImport($controller, 'Illuminate\\Support\\Facades\\Event');
 
-                    $setup[] = 'Event::fake();';
+                    $setup['mock'][] = 'Event::fake();';
 
                     $assertion = 'Event::assertDispatched(';
 
                     if ($statement->isNamedEvent()) {
                         $assertion .= $statement->event();
                     } else {
-                        $this->addImport($controller, 'App\\Events\\' . $statement->event());
+                        $this->addImport($controller, config('blueprint.namespace') . '\\Events\\' . $statement->event());
                         $assertion .= $statement->event() . '::class';
                     }
 
@@ -233,16 +241,16 @@ class TestGenerator implements Generator
 
                     $assertion .= '));';
 
-                    $assertions[] = $assertion;
+                    $assertions['mock'][] = $assertion;
                 } elseif ($statement instanceof RenderStatement) {
                     $tested_bits |= self::TESTS_VIEW;
 
-                    $assertions[] = '$response->assertOk();';
-                    $assertions[] = sprintf('$response->assertViewIs(\'%s\');', $statement->view());
+                    $assertions['response'][] = '$response->assertOk();';
+                    $assertions['response'][] = sprintf('$response->assertViewIs(\'%s\');', $statement->view());
 
                     foreach ($statement->data() as $data) {
                         // TODO: what if local eloquent/factory data
-                        $assertions[] = sprintf('$response->assertViewHas(\'%s\');', $data);
+                        $assertions['response'][] = sprintf('$response->assertViewHas(\'%s\');', $data);
                     }
                 } elseif ($statement instanceof RedirectStatement) {
                     $tested_bits |= self::TESTS_REDIRECT;
@@ -260,38 +268,41 @@ class TestGenerator implements Generator
 
                     $assertion .= '));';
 
-                    $assertions[] = $assertion;
+                    $assertions['response'][] = $assertion;
                 } elseif ($statement instanceof SessionStatement) {
-                    $assertions[] = sprintf('$response->assertSessionHas(\'%s\', %s);', $statement->reference(), '$' . str_replace('.', '->', $statement->reference()));
+                    $assertions['response'][] = sprintf('$response->assertSessionHas(\'%s\', %s);', $statement->reference(), '$' . str_replace('.', '->', $statement->reference()));
                 } elseif ($statement instanceof EloquentStatement) {
                     $this->addRefreshDatabaseTrait($controller);
 
                     $model = $this->determineModel($controller->prefix(), $statement->reference());
-                    $this->addImport($controller, 'App\\' . $model);
+                    $this->addImport($controller, config('blueprint.namespace') . '\\' . $model);
 
                     if ($statement->operation() === 'save') {
                         $tested_bits |= self::TESTS_SAVE;
 
                         $assertion = '';
+                        // TODO: ensure database has record
+                        // what if no request data...
 //                        '$posts = Post::where('title', $title)
 //                            ->where('content', $content)
 //                            ->get();
 //                        $this->assertCount(1, $posts);
 //                        $post = $posts->first();';
 
-                        // TODO: prepend as first assertion
-                        $assertions[] = $assertion;
+                        $assertions['sanity'][] = $assertion;
                     } elseif ($statement->operation() === 'find') {
-                        $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+                        $setup['data'][] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
                     } elseif ($statement->operation() === 'delete') {
                         $tested_bits |= self::TESTS_DELETE;
-                        $setup[] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
-                        $assertions[] = sprintf('$this->assertDeleted($%s);', $variable);
+                        $setup['data'][] = sprintf('$%s = factory(%s::class)->create();', $variable, $model);
+                        $assertions['generic'][] = sprintf('$this->assertDeleted($%s);', $variable);
                     }
                 } elseif ($statement instanceof QueryStatement) {
                     $this->addRefreshDatabaseTrait($controller);
 
-                    $this->addImport($controller, 'App\\' . $this->determineModel($controller->prefix(), $statement->model()));
+                    $setup['data'][] = sprintf('$%s = factory(%s::class, 3)->create();', Str::plural($variable), $model);
+
+                    $this->addImport($controller, config('blueprint.namespace') . '\\' . $this->determineModel($controller->prefix(), $statement->model()));
                 }
             }
 
@@ -303,19 +314,26 @@ class TestGenerator implements Generator
             $call .= ')';
 
             if ($request_data) {
-                $output = var_export($request_data, true);
-                $output = preg_replace('/^\s+/m', str_pad(' ', 12), $output);
-                $output = preg_replace(['/^array\s\(/', "/\)$/"], ['[', str_pad(' ', 8) . ']'], $output);
+                $call .= ', [';
+                $call .= PHP_EOL;
+                foreach ($request_data as $key => $datum) {
+                    $call .= str_pad(' ', 12);
+                    $call .= sprintf('\'%s\' => %s,', $key, $datum);
+                    $call .= PHP_EOL;
+                }
 
-                $call .= ', ' . trim($output);
+                $call .= str_pad(' ', 8) . ']';
             }
             $call .= ');';
 
-            $test_case = str_replace('// setup...', implode(PHP_EOL . self::INDENT, $setup), $test_case);
-            $test_case = str_replace('// call...', $call, $test_case);
-            $test_case = str_replace('// verify...', implode(PHP_EOL . self::INDENT, $assertions), $test_case);
+            $body = implode(PHP_EOL . PHP_EOL, array_map([$this, 'buildLines'], array_filter($setup)));
+            $body .= PHP_EOL . PHP_EOL;
+            $body .= str_pad(' ', 8) . $call;
+            $body .= PHP_EOL . PHP_EOL;
+            $body .= implode(PHP_EOL . PHP_EOL, array_map([$this, 'buildLines'], array_filter($assertions)));
 
             $test_case = str_replace('dummy_test_case', $this->buildTestCaseName($name, $tested_bits), $test_case);
+            $test_case = str_replace('// ...', trim($body), $test_case);
 
             $test_cases .= PHP_EOL . $test_case . PHP_EOL;
         }
@@ -453,5 +471,10 @@ END;
         }
 
         return $name . '_' . implode('_', $verifications) . '_and_' . $final_verification;
+    }
+
+    private function buildLines($lines)
+    {
+        return str_pad(' ', 8) . implode(PHP_EOL . str_pad(' ', 8), $lines);
     }
 }
